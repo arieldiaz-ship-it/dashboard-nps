@@ -1,180 +1,323 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import google.generativeai as genai
+import plotly.graph_objects as go
+from google import generativeai as genai
 import json
 import os
 from datetime import datetime
+import base64
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="CX Dashboard Auto - IA", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="CX Dashboard Auto - IA",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# Estilo personalizado para emular el dashboard oscuro
+# --- ESTILOS CSS PARA REPLICAR REACT/TAILWIND ---
 st.markdown("""
-    <style>
-    .main { background-color: #0f172a; color: #f1f5f9; }
-    .stMetric { background-color: #1e293b; padding: 20px; border-radius: 15px; border: 1px solid #334155; }
-    div[data-testid="stExpander"] { border: none !important; box-shadow: none !important; background-color: transparent !important; }
-    .stAlert { border-radius: 15px; border: 1px solid #854d0e; background-color: rgba(66, 32, 6, 0.5); }
-    </style>
+<style>
+    /* Fondo y Tipografía General */
+    .stApp {
+        background-color: #0f172a;
+        color: #f1f5f9;
+        font-family: 'Inter', -apple-system, sans-serif;
+    }
+    
+    /* Header Estilo React */
+    .header-container {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding-bottom: 2rem;
+        margin-bottom: 2rem;
+        border-bottom: 1px solid #1e293b;
+    }
+    .logo-text {
+        font-size: 1.8rem;
+        font-weight: 900;
+        text-transform: uppercase;
+        font-style: italic;
+        letter-spacing: -0.05em;
+    }
+    .cyan-text { color: #06b6d4; }
+    
+    /* Tarjetas KPI */
+    .kpi-card {
+        background: rgba(30, 41, 59, 0.5);
+        border: 1px solid #334155;
+        border-radius: 1rem;
+        padding: 1.5rem;
+        height: 100%;
+    }
+    .kpi-title {
+        color: #94a3b8;
+        font-weight: 600;
+        margin-bottom: 1rem;
+        text-transform: uppercase;
+        font-size: 0.8rem;
+    }
+    .kpi-value {
+        font-size: 3.5rem;
+        font-weight: 800;
+        line-height: 1;
+    }
+    
+    /* Alertas Críticas Estilo React */
+    .alert-container {
+        background: rgba(133, 77, 14, 0.1);
+        border: 1px solid rgba(161, 98, 7, 0.5);
+        border-radius: 1.5rem;
+        padding: 1.5rem;
+        margin-top: 2rem;
+        position: relative;
+    }
+    .alert-header {
+        color: #fde047;
+        font-weight: 900;
+        text-transform: uppercase;
+        margin-bottom: 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    
+    /* Botones de Módulo */
+    .stButton>button {
+        background-color: #1e293b;
+        color: #94a3b8;
+        border: 1px solid #334155;
+        border-radius: 0.75rem;
+        font-weight: 700;
+        transition: all 0.3s;
+    }
+    .stButton>button:hover {
+        border-color: #06b6d4;
+        color: #06b6d4;
+    }
+    
+    /* Esconder elementos innecesarios de Streamlit */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
 """, unsafe_allow_html=True)
 
-# --- LÓGICA DE PROCESAMIENTO ---
-def calculate_nps(df, column):
-    scores = pd.to_numeric(df[column], errors='coerce').dropna()
-    if len(scores) == 0: return 0, 0, 0, 0, 0
+# --- FUNCIONES DE CÁLCULO (Lógica Original) ---
+def calculate_nps_details(df, score_col):
+    scores = pd.to_numeric(df[score_col], errors='coerce').dropna()
+    total = len(scores)
+    if total == 0: return 0, 0, 0, 0, 0
+    
     promoters = len(scores[scores >= 9])
     passives = len(scores[(scores >= 7) & (scores < 9)])
     detractors = len(scores[scores < 7])
-    total = len(scores)
-    score = ((promoters - detractors) / total) * 100
-    return score, promoters, passives, detractors, total
-
-def get_alerts(df, global_nps):
-    # Umbral de impacto: >= 5% del volumen
-    total_vol = len(df)
-    threshold_vol = total_vol * 0.05
     
-    # 1. Alertas por Sucursal con bajo NPS
-    sucursales = df.groupby('Sucursal').apply(lambda x: calculate_nps(x, 'Nota NPS CCS')[0])
-    sucursal_vol = df.groupby('Sucursal').size()
+    nps = ((promoters - detractors) / total) * 100
+    return nps, promoters, passives, detractors, total
+
+def get_critical_alerts(df, global_nps_ccs):
+    total_vol = len(df)
+    threshold_vol = total_vol * 0.05 # UMERAL 5% SOLICITADO
     
     alerts = []
-    for suc, score in sucursales.items():
-        vol = sucursal_vol[suc]
-        if vol >= threshold_vol and score < (global_nps - 10):
-            weight = (vol / total_vol) * 100
-            alerts.append(f"⚠️ {suc}: NPS {score:.0f} | Impacto: {weight:.1f}% del volumen")
-            
-    # 2. Alertas por Brecha Marca vs CCS
-    concesionarios = df.groupby('Concesionario')
-    brechas = []
-    for name, group in concesionarios:
+    
+    # Desviación por sucursal
+    sucursales = df.groupby('Sucursal')
+    for name, group in sucursales:
         vol = len(group)
         if vol >= threshold_vol:
-            nps_marca = calculate_nps(group, 'Nota NPS Marca')[0]
-            nps_ccs = calculate_nps(group, 'Nota NPS CCS')[0]
-            diff = abs(nps_marca - nps_ccs)
+            nps, _, _, _, _ = calculate_nps_details(group, 'Nota NPS CCS')
+            if nps < (global_nps_ccs - 10):
+                alerts.append({
+                    "type": "Desviación",
+                    "msg": f"**{name}**: NPS {nps:.0f} (Impacto: {(vol/total_vol)*100:.1f}%)"
+                })
+                
+    # Brecha Marca vs CCS
+    for name, group in df.groupby('Concesionario'):
+        vol = len(group)
+        if vol >= threshold_vol:
+            nps_m, _, _, _, _ = calculate_nps_details(group, 'Nota NPS Marca')
+            nps_c, _, _, _, _ = calculate_nps_details(group, 'Nota NPS CCS')
+            diff = abs(nps_m - nps_c)
             if diff > 15:
-                weight = (vol / total_vol) * 100
-                brechas.append(f"🚩 {name}: Brecha de {diff:.0f} pts (Marca {nps_marca:.0f} vs CCS {nps_ccs:.0f}) | Peso: {weight:.1f}%")
-    
-    return alerts, brechas
+                alerts.append({
+                    "type": "Brecha",
+                    "msg": f"**{name}**: Brecha {diff:.0f} pts (Impacto: {(vol/total_vol)*100:.1f}%)"
+                })
+    return alerts
 
-# --- SERVICIOS IA ---
-def run_ai_analysis(comments, api_key):
-    if not comments: return None
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash') # O el modelo disponible
-    
-    prompt = f"""
-    Actúa como Experto CX Automotriz. Analiza estos comentarios:
-    {chr(10).join(comments[:200])}
-    
-    Devuelve un JSON con:
-    - satisfaction_topics: list of {{topic, count, keywords}}
-    - dissatisfaction_topics: list of {{topic, count, keywords}}
-    - summary: 2 sentences max.
-    """
-    
+# --- INTEGRACIÓN GEMINI ---
+def analyze_with_ai(comments, api_key):
+    if not api_key or not comments: return None
     try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-3-flash-preview')
+        
+        prompt = f"""
+        Actúa como un Experto Analista de Datos CX Automotriz. Analiza estos comentarios:
+        {chr(10).join(comments[:150])}
+        
+        Devuelve un JSON exacto:
+        {{
+          "satisfaction_topics": [{{"topic": "...", "count": 0}}],
+          "dissatisfaction_topics": [{{"topic": "...", "count": 0}}],
+          "summary": "Resumen ejecutivo en 2 frases."
+        }}
+        """
         response = model.generate_content(prompt)
-        # Limpiar respuesta para JSON
-        text = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(text)
+        return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
     except:
         return None
 
 # --- UI PRINCIPAL ---
-st.title("🚗 CX DASHBOARD AUTO - STREAMLIT EDITION")
-st.caption("Data Insight System v3.1 | Powered by Gemini IA")
+# Header
+st.markdown("""
+    <div class="header-container">
+        <div>
+            <div class="logo-text">CX Dashboard <span class="cyan-text">Auto</span></div>
+            <div style="color: #64748b; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.2em;">Data Insight System v3.1</div>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("Configuración")
-    api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("API_KEY", ""))
-    uploaded_file = st.file_uploader("Cargar Base NPS/CSI (Excel/CSV)", type=["xlsx", "csv"])
+# Entrada de Datos Dual (Mismo diseño que React)
+if 'venta_df' not in st.session_state:
+    st.markdown('<div style="text-align: center; margin-bottom: 2rem; color: #94a3b8;">Carga los archivos de Ventas y Postventa para iniciar el análisis integral.</div>', unsafe_allow_html=True)
     
-    if uploaded_file:
-        df_raw = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
-        marcas = ["TODAS"] + sorted(df_raw['Marca'].dropna().unique().tolist())
-        selected_brand = st.selectbox("Filtrar por Marca", marcas)
+    col_v, col_p = st.columns(2)
+    
+    with col_v:
+        st.markdown('<div class="kpi-card"><h3 style="color:white; font-weight:900; margin-bottom:0;">MÓDULO VENTAS</h3><p style="color:#64748b; font-size:12px;">Base de datos de entregas y 0km</p></div>', unsafe_allow_html=True)
+        file_v = st.file_uploader("Subir CSV/XLSX Ventas", type=['csv', 'xlsx'], key="v_upload")
         
-        tab_active = st.radio("Módulo", ["Ventas", "Postventa"])
+    with col_p:
+        st.markdown('<div class="kpi-card"><h3 style="color:white; font-weight:900; margin-bottom:0;">MÓDULO POSTVENTA</h3><p style="color:#64748b; font-size:12px;">Base de datos de servicios y taller</p></div>', unsafe_allow_html=True)
+        file_p = st.file_uploader("Subir CSV/XLSX Postventa", type=['csv', 'xlsx'], key="p_upload")
+    
+    st.divider()
+    api_key_input = st.text_input("Gemini API Key (Para análisis cualitativo)", type="password")
+    
+    if st.button("🚀 CARGAR E INICIAR ANÁLISIS", use_container_width=True):
+        if file_v: st.session_state.venta_df = pd.read_excel(file_v) if file_v.name.endswith('xlsx') else pd.read_csv(file_v)
+        if file_p: st.session_state.post_df = pd.read_excel(file_p) if file_p.name.endswith('xlsx') else pd.read_csv(file_p)
+        st.session_state.api_key = api_key_input
+        st.rerun()
 
-if uploaded_file:
+# Reporte de Salida
+else:
+    # Sidebar para controles
+    with st.sidebar:
+        st.markdown("### 🎛️ CONTROLES")
+        active_tab = st.radio("Módulo Activo", ["Ventas", "Postventa"])
+        
+        current_df = st.session_state.venta_df if active_tab == "Ventas" else st.session_state.post_df
+        
+        brands = ["TODAS"] + sorted(current_df['Marca'].dropna().unique().tolist())
+        selected_brand = st.selectbox("Marca", brands)
+        
+        if st.button("Reiniciar"):
+            for key in st.session_state.keys(): del st.session_state[key]
+            st.rerun()
+
     # Filtrado
-    df = df_raw.copy()
+    df = current_df.copy()
     if selected_brand != "TODAS":
         df = df[df['Marca'] == selected_brand]
+        
+    # KPIs Estilo React
+    n_marca, prom_m, pass_m, detr_m, total_m = calculate_nps_details(df, 'Nota NPS Marca')
+    n_ccs, prom_c, pass_c, detr_c, total_c = calculate_nps_details(df, 'Nota NPS CCS')
     
-    # --- KPIs ---
-    nps_marca_score, p, pas, d, total = calculate_nps(df, 'Nota NPS Marca')
-    nps_ccs_score, cp, cpas, cd, ctotal = calculate_nps(df, 'Nota NPS CCS')
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(f"NPS Marca - {tab_active}", f"{nps_marca_score:.0f}", delta=None)
-        st.caption(f"Basado en {total} encuestas")
-    with col2:
-        st.metric(f"NPS CCS - {tab_active}", f"{nps_ccs_score:.0f}", delta=None)
-        st.caption(f"Basado en {ctotal} encuestas")
+    k1, k2 = st.columns(2)
+    with k1:
+        color = "#4ade80" if n_marca > 50 else "#facc15" if n_marca > 0 else "#f87171"
+        st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">NPS Marca ({active_tab})</div>
+                <div style="display: flex; justify-content: space-between; align-items: flex-end;">
+                    <div class="kpi-value" style="color: {color};">{n_marca:.0f}</div>
+                    <div style="text-align: right; font-size: 11px; color: #94a3b8;">
+                        <div style="color:#4ade80">{prom_m} Promotores</div>
+                        <div style="color:#facc15">{pass_m} Pasivos</div>
+                        <div style="color:#f87171">{detr_m} Detractores</div>
+                        <div style="margin-top:4px">Total: {total_m}</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+    with k2:
+        color_c = "#4ade80" if n_ccs > 50 else "#facc15" if n_ccs > 0 else "#f87171"
+        st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">NPS Concesionario - CCS ({active_tab})</div>
+                <div style="display: flex; justify-content: space-between; align-items: flex-end;">
+                    <div class="kpi-value" style="color: {color_c};">{n_ccs:.0f}</div>
+                    <div style="text-align: right; font-size: 11px; color: #94a3b8;">
+                        <div style="color:#4ade80">{prom_c} Promotores</div>
+                        <div style="color:#facc15">{pass_c} Pasivos</div>
+                        <div style="color:#f87171">{detr_c} Detractores</div>
+                        <div style="margin-top:4px">Total: {total_c}</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
 
-    # --- EVOLUCIÓN ---
-    st.subheader("📊 Evolución Temporal")
-    # Intentar detectar fecha
+    # Gráfico de Tendencia
+    st.markdown('<div class="kpi-card" style="margin-top: 1.5rem;">', unsafe_allow_html=True)
+    st.subheader(f"📈 Evolución Temporal - {active_tab}")
     date_col = next((c for c in df.columns if 'fecha' in c.lower() or 'periodo' in c.lower()), None)
     if date_col:
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df_trend = df.set_index(date_col).resample('M').apply(lambda x: calculate_nps(x, 'Nota NPS Marca')[0]).reset_index()
-        df_trend.columns = ['Mes', 'NPS']
-        fig = px.line(df_trend, x='Mes', y='NPS', title='Tendencia NPS Marca', markers=True, template="plotly_dark")
+        trend = df.set_index(date_col).resample('M').apply(lambda x: calculate_nps_details(x, 'Nota NPS Marca')[0]).reset_index()
+        trend.columns = ['Mes', 'NPS']
+        fig = px.line(trend, x='Mes', y='NPS', template="plotly_dark", markers=True)
         fig.update_traces(line_color='#06b6d4', line_width=4)
+        fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=350)
         st.plotly_chart(fig, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # --- ALERTAS CRÍTICAS (Ubicadas según solicitud) ---
-    st.subheader(f"⚠️ Alertas Críticas de CX - {tab_active}")
-    alertas_suc, alertas_brecha = get_alerts(df, nps_ccs_score)
-    
-    if alertas_suc or alertas_brecha:
-        c1, c2 = st.columns(2)
-        with c1:
-            if alertas_suc:
-                st.warning("**Desviación en Sucursales (Impacto >5%)**\n\n" + "\n\n".join(alertas_suc))
-        with c2:
-            if alertas_brecha:
-                st.error("**Brechas Marca vs CCS (Impacto >5%)**\n\n" + "\n\n".join(alertas_brecha))
+    # ALERTAS CRÍTICAS AL 5%
+    alertas = get_critical_alerts(df, n_ccs)
+    if alertas:
+        st.markdown(f"""
+            <div class="alert-container">
+                <div class="alert-header">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+                    Alertas Críticas de CX - {active_tab}
+                    <span style="font-size: 9px; margin-left: auto; color: rgba(253, 224, 71, 0.5);">FILTRO IMPACTO: >5% VOL</span>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                    {"".join([f'<div style="background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px; font-size: 13px; color: #fde047;">{a["msg"]}</div>' for a in alertas])}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
     else:
-        st.success(f"No se detectan alertas de alto impacto (>5% vol) en {tab_active}")
+        st.success(f"No se detectan alertas críticas significativas (>5% vol) en {active_tab}")
 
-    # --- ANÁLISIS CUALITATIVO IA ---
-    st.subheader("🤖 Análisis Cualitativo (Voz del Cliente por IA)")
-    if api_key:
-        comments = df['Comentario'].dropna().tolist()
-        if st.button("Generar Insights con IA"):
-            with st.spinner("Analizando sentimientos y tópicos..."):
-                analysis = run_ai_analysis(comments, api_key)
-                if analysis:
-                    st.info(f"**Resumen Ejecutivo:** {analysis['summary']}")
-                    ca1, ca2 = st.columns(2)
-                    with ca1:
-                        st.write("**👍 Fortalezas**")
-                        for t in analysis['satisfaction_topics']:
-                            st.write(f"- {t['topic']} ({t['count']} menciones)")
-                    with ca2:
-                        st.write("**👎 Oportunidades**")
-                        for t in analysis['dissatisfaction_topics']:
-                            st.write(f"- {t['topic']} ({t['count']} menciones)")
-    else:
-        st.info("Introduce tu Gemini API Key en la barra lateral para activar el análisis de texto.")
+    # IA y Análisis Cualitativo
+    st.divider()
+    if st.session_state.get('api_key'):
+        st.subheader("🤖 Análisis Cualitativo IA")
+        comentarios = df['Comentario'].dropna().tolist()
+        res_ia = analyze_with_ai(comentarios, st.session_state.api_key)
+        if res_ia:
+            st.info(f"**Resumen IA:** {res_ia['summary']}")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**✅ Fortalezas**")
+                for t in res_ia['satisfaction_topics']: st.write(f"- {t['topic']} ({t['count']})")
+            with c2:
+                st.write("**❌ Oportunidades**")
+                for t in res_ia['dissatisfaction_topics']: st.write(f"- {t['topic']} ({t['count']})")
 
-    # --- TABLAS DE DETALLE ---
-    st.subheader("📋 Detalle por Concesionario")
-    concesionarios_nps = df.groupby('Concesionario').apply(lambda x: pd.Series({
-        'NPS Marca': calculate_nps(x, 'Nota NPS Marca')[0],
-        'NPS CCS': calculate_nps(x, 'Nota NPS CCS')[0],
+    # Tabla Detalle
+    st.subheader("📋 Detalle por Sucursal")
+    suc_table = df.groupby('Sucursal').apply(lambda x: pd.Series({
+        'NPS Marca': calculate_nps_details(x, 'Nota NPS Marca')[0],
+        'NPS CCS': calculate_nps_details(x, 'Nota NPS CCS')[0],
         'Encuestas': len(x)
     })).reset_index()
-    st.dataframe(concesionarios_nps.style.background_gradient(subset=['NPS Marca', 'NPS CCS'], cmap='RdYlGn'), use_container_width=True)
-
-else:
-    st.info("Por favor, carga un archivo para comenzar el análisis.")
+    st.dataframe(suc_table.sort_values('NPS Marca', ascending=False), use_container_width=True)
